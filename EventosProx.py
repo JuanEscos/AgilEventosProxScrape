@@ -3,21 +3,7 @@
 """
 FlowAgility scraper + procesado (dos pasos, un archivo).
 Subcomandos:
-  - scrape  : descarga eventos y participantes (CSV diarios versionados)
-  - process : genera participantes_procesado_YYYY-MM-DD.csv (versionado)
-  - all     : scrape + process
-
-Ejemplos:
-  python script.py scrape
-  python script.py process
-  python script.py all
-"""
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-FlowAgility scraper + procesado (dos pasos, un archivo).
-Subcomandos:
-  - scrape  : descarga eventos y participantes (CSV diarios versionados)
+  - scrape  : descarga eventos y participantes (CSV diarios con reanudación)
   - process : genera participantes_procesado_YYYY-MM-DD.csv (versionado)
   - all     : scrape + process
 
@@ -36,15 +22,24 @@ Variables .env (junto al script):
   SHOW_CONFIG=true
   CHROME_BINARY=/ruta/a/google-chrome
   CHROMEDRIVER_PATH=/ruta/a/chromedriver
+
+  # NUEVO (opcional):
+  RESUME=true                 # reanudar si existe progreso del día
+  SLOW_MIN_S=1.0              # pausa mínima aleatoria entre acciones clave
+  SLOW_MAX_S=3.0              # pausa máxima aleatoria entre acciones clave
+  MAX_SCROLLS=24
+  SCROLL_WAIT_S=2.0
+  PER_PART_TIMEOUT_S=10
+  RENDER_POLL_S=0.25
+  MAX_EVENT_SECONDS=1800
 """
 
-import os, csv, sys, re, traceback, unicodedata, argparse
+import os, csv, sys, re, traceback, unicodedata, argparse, json
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from pathlib import Path
 import time, random
 
-# Terceros
 from dotenv import load_dotenv
 
 # ----------------------------- Utilidades ENV -----------------------------
@@ -84,17 +79,27 @@ if not FLOW_EMAIL or not FLOW_PASS:
 HEADLESS           = _env_bool("HEADLESS", True)
 INCOGNITO          = _env_bool("INCOGNITO", True)
 MAX_SCROLLS        = _env_int("MAX_SCROLLS", 24)
-SCROLL_WAIT_S      = _env_float("SCROLL_WAIT_S", 0.5)
+SCROLL_WAIT_S      = _env_float("SCROLL_WAIT_S", 2.0)
 CLICK_RETRIES      = _env_int("CLICK_RETRIES", 3)
-PER_PART_TIMEOUT_S = _env_float("PER_PART_TIMEOUT_S", 6)
-RENDER_POLL_S      = _env_float("RENDER_POLL_S", 0.15)
+PER_PART_TIMEOUT_S = _env_float("PER_PART_TIMEOUT_S", 10)
+RENDER_POLL_S      = _env_float("RENDER_POLL_S", 0.25)
 MAX_EVENT_SECONDS  = _env_int("MAX_EVENT_SECONDS", 1800)
 OUT_DIR            = os.path.abspath(os.getenv("OUT_DIR", "./ListaEventos"))
+RESUME             = _env_bool("RESUME", True)
+SLOW_MIN_S         = _env_float("SLOW_MIN_S", 1.0)
+SLOW_MAX_S         = _env_float("SLOW_MAX_S", 3.0)
+
 os.makedirs(OUT_DIR, exist_ok=True)
 
 DATE_STR = datetime.now().strftime("%Y-%m-%d")
 UUID_RE  = re.compile(r"/zone/events/([0-9a-fA-F-]{36})(?:/.*)?$")
 
+# Ficheros del día (estables para reanudar)
+CSV_EVENT_PATH = os.path.join(OUT_DIR, f"events_{DATE_STR}.csv")
+CSV_PART_PATH  = os.path.join(OUT_DIR, f"participants_{DATE_STR}.csv")
+PROGRESS_PATH  = os.path.join(OUT_DIR, f"progress_{DATE_STR}.json")
+
+# ----------------------------- Utilidades logging / pausas -----------------------------
 def _print_effective_config():
     if str(os.getenv("SHOW_CONFIG", "false")).lower() not in ("1","true","yes","on","t"):
         return
@@ -109,11 +114,21 @@ def _print_effective_config():
     print(f"RENDER_POLL_S        = {RENDER_POLL_S}")
     print(f"MAX_EVENT_SECONDS    = {MAX_EVENT_SECONDS}")
     print(f"OUT_DIR              = {OUT_DIR}")
+    print(f"RESUME               = {RESUME}")
+    print(f"SLOW_MIN_S           = {SLOW_MIN_S}")
+    print(f"SLOW_MAX_S           = {SLOW_MAX_S}")
     print(f"CHROME_BINARY        = {os.getenv('CHROME_BINARY') or ''}")
     print(f"CHROMEDRIVER_PATH    = {os.getenv('CHROMEDRIVER_PATH') or ''}")
     print("=======================")
 
 def log(msg): print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def slow_pause(min_s=None, max_s=None):
+    """Pausa aleatoria para no saturar; usa .env si no se indica."""
+    a = SLOW_MIN_S if min_s is None else float(min_s)
+    b = SLOW_MAX_S if max_s is None else float(max_s)
+    if b < a: a, b = b, a
+    time.sleep(random.uniform(a, b))
 
 def next_free_path(path: str) -> str:
     """Si path existe, devuelve path con sufijo _v2, _v3, … libre."""
@@ -127,8 +142,54 @@ def next_free_path(path: str) -> str:
             return cand
         i += 1
 
+# ============================== Progreso (resume) ==============================
+def _load_progress():
+    if RESUME and os.path.exists(PROGRESS_PATH):
+        try:
+            with open(PROGRESS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"done_events": [], "last_part_index": {}, "total_found": 0}
+
+def _save_progress(state):
+    tmp = PROGRESS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, PROGRESS_PATH)
+
+def _is_event_done(state, uuid):
+    return uuid in set(state.get("done_events", []))
+
+def _get_last_part_index(state, uuid):
+    return int(state.get("last_part_index", {}).get(uuid, 0))
+
+def _set_last_part_index(state, uuid, idx):
+    state.setdefault("last_part_index", {})[uuid] = int(idx)
+    _save_progress(state)
+
+def _mark_event_done(state, uuid):
+    de = set(state.get("done_events", []))
+    if uuid not in de:
+        de.add(uuid)
+        state["done_events"] = sorted(de)
+        _save_progress(state)
+
+# ============================== CSV seguro (append + cabecera si no existe) ==============================
+def _ensure_csv_header(path, header):
+    exist = os.path.exists(path)
+    if not exist:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=header)
+            w.writeheader()
+
+def _append_csv_row(path, header, row_dict):
+    _ensure_csv_header(path, header)
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writerow({k: row_dict.get(k, "") for k in header})
+
 # ============================== PARTE 1: SCRAPER ==============================
-from selenium.webdriver.chrome.service import Service
 def _import_selenium():
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -141,10 +202,8 @@ def _import_selenium():
     )
     return webdriver, By, Options, WebDriverWait, EC, JavascriptException, StaleElementReferenceException, NoSuchElementException, ElementClickInterceptedException, TimeoutException
 
-
 def _get_driver():
     webdriver, By, Options, *_ = _import_selenium()
-    # Import local para evitar exigir Selenium cuando solo se procesa CSV
     from selenium.webdriver.chrome.service import Service
 
     opts = Options()
@@ -156,21 +215,15 @@ def _get_driver():
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36")
 
-    # Permitir override del binario/driver desde .env
     chrome_bin = os.getenv("CHROME_BINARY")
     if chrome_bin:
-        opts.binary_location = chrome_bin  # Debe apuntar a chrome.exe
+        opts.binary_location = chrome_bin
 
     driver_path = os.getenv("CHROMEDRIVER_PATH", "").strip()
-
     if driver_path:
-        # Selenium 4: hay que usar Service
         service = Service(executable_path=driver_path)
         return webdriver.Chrome(service=service, options=opts)
-
-    # Si no se especifica CHROMEDRIVER_PATH, usa el que esté en el PATH
     return webdriver.Chrome(options=opts)
-
 
 def _save_screenshot(driver, name):
     try:
@@ -191,15 +244,14 @@ def _accept_cookies(driver, By):
             btns = driver.find_elements(By.CSS_SELECTOR, sel)
             if btns:
                 btns[0].click()
-                #time.sleep(0.2)
-                time.sleep(random.uniform(1, 2))  # espera entre 1.5 y 3.5 segundos
+                slow_pause(0.8, 1.8)
                 return
         driver.execute_script("""
             const b=[...document.querySelectorAll('button')]
             .find(x=>/acept|accept|consent|de acuerdo/i.test(x.textContent));
             if(b) b.click();
         """)
-        time.sleep(random.uniform(0.1, 0.2))  # espera entre 1.5 y 3.5 segundos
+        slow_pause(0.2, 0.5)
     except Exception:
         pass
 
@@ -213,9 +265,12 @@ def _login(driver, By, WebDriverWait, EC):
     email = wait.until(EC.presence_of_element_located((By.NAME, "user[email]")))
     pwd   = driver.find_element(By.NAME, "user[password]")
     email.clear(); email.send_keys(FLOW_EMAIL)
+    slow_pause(0.2, 0.4)
     pwd.clear();   pwd.send_keys(FLOW_PASS)
+    slow_pause(0.2, 0.4)
     driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]').click()
     wait.until(lambda d: "/user/login" not in d.current_url)
+    slow_pause()
     log("Login OK.")
 
 def _ensure_logged_in(driver, max_tries, By, WebDriverWait, EC):
@@ -224,7 +279,7 @@ def _ensure_logged_in(driver, max_tries, By, WebDriverWait, EC):
             return True
         log("Sesión caducada. Reintentando login…")
         _login(driver, By, WebDriverWait, EC)
-        time.sleep(random.uniform(0.5, 1))  # espera entre 1.5 y 3.5 segundos
+        slow_pause(0.5, 1.2)
         if not _is_login_page(driver):
             return True
     return False
@@ -233,7 +288,7 @@ def _full_scroll(driver):
     last_h = 0
     for _ in range(MAX_SCROLLS):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(SCROLL_WAIT_S)
+        time.sleep(SCROLL_WAIT_S)  # ritmo de scroll configurable
         h = driver.execute_script("return document.body.scrollHeight;")
         if h == last_h:
             break
@@ -244,6 +299,7 @@ def _collect_event_urls(driver, By, WebDriverWait, EC):
     WebDriverWait(driver, 25).until(lambda d: d.find_element(By.TAG_NAME, "body"))
     _accept_cookies(driver, By)
     _full_scroll(driver)
+    slow_pause()
 
     by_uuid = {}
     anchors = driver.find_elements(By.TAG_NAME, "a")
@@ -273,7 +329,6 @@ EMOJI_RE = re.compile(
     "\U0001F700-\U0001F77F\U0001F780-\U0001F7FF\U0001F800-\U0001F8FF\U0001F900-\U0001F9FF"
     "\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF]+"
 )
-
 def _clean(s: str) -> str:
     if not s:
         return ""
@@ -465,7 +520,7 @@ def _scrape_event_info(driver, base_event_url, plist_url, By, WebDriverWait, EC)
     driver.get(base_event_url)
     WebDriverWait(driver, 20).until(lambda d: d.find_element(By.TAG_NAME, "body"))
     _accept_cookies(driver, By)
-    time.sleep(random.uniform(0.2, 0.3))  # espera entre 0.2 y 0.3 segundos
+    slow_pause(0.4, 0.8)
 
     header_lines = _read_header()
     body_txt     = _body_text()
@@ -490,7 +545,7 @@ def _scrape_event_info(driver, base_event_url, plist_url, By, WebDriverWait, EC)
         try:
             driver.get(alt)
             WebDriverWait(driver, 15).until(lambda d: d.find_element(By.TAG_NAME, "body"))
-            time.sleep(random.uniform(0.2, 0.3))  # espera entre 0.2 y 0.3 segundos
+            slow_pause(0.4, 0.8)
             header_lines = _read_header()
             body_txt     = _body_text()
             if data["dates"]     == "N/D": data["dates"]     = _get_dates(header_lines, body_txt)
@@ -515,6 +570,7 @@ def _scrape_event_info(driver, base_event_url, plist_url, By, WebDriverWait, EC)
 
     return data
 
+# --- JS para mapear participante ---
 JS_MAP_PARTICIPANT_RICH = r"""
 const pid = arguments[0];
 const root = document.getElementById(pid);
@@ -529,10 +585,6 @@ function classListArray(el){
   if (typeof cn === 'string') return cn.trim().split(/\s+/);
   if (typeof cn === 'object' && 'baseVal' in cn) return String(cn.baseVal).trim().split(/\s+/);
   return String(cn).trim().split(/\s+/);
-}
-function hasAll(el, toks){
-  const set = new Set(classListArray(el));
-  return toks.every(t => set.has(t));
 }
 function isHeader(el){
   const arr = classListArray(el);
@@ -620,9 +672,9 @@ def _click_toggle_by_pid(driver, pid, By, WebDriverWait, EC, TimeoutException, S
             WebDriverWait(driver, 8).until(lambda d: d.find_element(By.ID, pid))
             return driver.find_element(By.ID, pid)
         except (StaleElementReferenceException, NoSuchElementException, ElementClickInterceptedException, TimeoutException):
-            time.sleep(random.uniform(0.2, 0.3))  # espera entre 0.2 y 0.3 segundos
+            slow_pause(0.2, 0.5)
             driver.execute_script("window.scrollBy(0, 120);")
-            time.sleep(random.uniform(0.2, 0.3))  # espera entre 0.2 y 0.3 segundos
+            slow_pause(0.2, 0.5)
             continue
     return None
 
@@ -658,34 +710,23 @@ def _fallback_map_participant(driver, pid, By):
         })
     return {"fields": fields, "schedule": schedule}
 
-def _write_csv(path, rows, header=None):
-    """Modo 'w' siempre; si ya existía hoy, path vendrá versionado por next_free_path()."""
-    if not rows:
-        return
-    if not header:
-        keys = set()
-        for r in rows: keys.update(r.keys())
-        header = sorted(keys)
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in header})
+# ----------------------------- Cabeceras CSV canónicas -----------------------------
+EVENT_HEADER = [
+    "uuid","event_url","title","organizer","location","dates",
+    "header_1","header_2","header_3","header_4","header_5","header_6",
+    "judges"
+]
 
-def _build_participants_header(rows):
-    base = [
-        "event_uuid","event_title","participants_url","BinomID","Dorsal","Guía","Perro","Raza",
-        "Edad","Género","Altura (cm)","Nombre de Pedigree","País","Licencia","Club","Federación","Equipo"
-    ]
-    max_i = 0
-    for r in rows:
-        for k in r.keys():
-            m = re.match(r"Fecha (\d+)", k)
-            if m:
-                max_i = max(max_i, int(m.group(1)))
-    for i in range(1, max_i+1):
-        base.extend([f"Día {i}", f"Fecha {i}", f"Mangas {i}"])
-    return base
+# Para facilitar append, fijamos 6 bloques Día/Fecha/Mangas
+PART_BASE = [
+    "participants_url","BinomID","Dorsal","Guía","Perro","Raza","Edad","Género",
+    "Altura (cm)","Nombre de Pedigree","País","Licencia","Club","Federación","Equipo",
+    "event_uuid","event_title"
+]
+PART_SLOTS = []
+for i in range(1, 7):
+    PART_SLOTS += [f"Día {i}", f"Fecha {i}", f"Mangas {i}"]
+PART_HEADER = PART_BASE + PART_SLOTS
 
 def scrape_main():
     _print_effective_config()
@@ -694,69 +735,96 @@ def scrape_main():
      JavascriptException, StaleElementReferenceException,
      NoSuchElementException, ElementClickInterceptedException, TimeoutException) = _import_selenium()
 
-    csv_event = next_free_path(os.path.join(OUT_DIR, f"events_{DATE_STR}.csv"))
-    csv_part  = next_free_path(os.path.join(OUT_DIR, f"participants_{DATE_STR}.csv"))
+    # Si no reanudamos, versiona los nombres para no pisar
+    csv_event = CSV_EVENT_PATH if RESUME else next_free_path(CSV_EVENT_PATH)
+    csv_part  = CSV_PART_PATH  if RESUME else next_free_path(CSV_PART_PATH)
+
+    # Asegura cabeceras si reanudamos o empezamos
+    _ensure_csv_header(csv_event, EVENT_HEADER)
+    _ensure_csv_header(csv_part, PART_HEADER)
+
+    # Carga/crea progreso
+    state = _load_progress()
 
     driver = _get_driver()
     try:
         _login(driver, By, WebDriverWait, EC)
         urls_by_uuid = _collect_event_urls(driver, By, WebDriverWait, EC)
         log(f"Eventos (UUIDs) encontrados: {len(urls_by_uuid)}")
+        state["total_found"] = len(urls_by_uuid)
+        _save_progress(state)
 
-        all_event_rows = []
-        all_part_rows  = []
-
+        # --- Itera eventos (respetando progreso) ---
         for uuid, pair in urls_by_uuid.items():
+            if _is_event_done(state, uuid):
+                # Ya se terminó este evento anteriormente
+                continue
+
             start_event_ts = time.time()
             base_url = pair["base"]
             plist    = pair["plist"]
 
+            # 1) INFO DEL EVENTO -> append inmediato
             ev = _scrape_event_info(driver, base_url, plist, By, WebDriverWait, EC)
-            ev["uuid"] = uuid
-            all_event_rows.append(ev)
+            ev_row = {
+                "uuid": uuid,
+                "event_url": ev.get("event_url",""),
+                "title": ev.get("title","N/D"),
+                "organizer": ev.get("organizer","N/D"),
+                "location": ev.get("location","N/D"),
+                "dates": ev.get("dates","N/D"),
+                "header_1": ev.get("header_1",""),
+                "header_2": ev.get("header_2",""),
+                "header_3": ev.get("header_3",""),
+                "header_4": ev.get("header_4",""),
+                "header_5": ev.get("header_5",""),
+                "header_6": ev.get("header_6",""),
+                "judges": ev.get("judges","N/D"),
+            }
+            _append_csv_row(csv_event, EVENT_HEADER, ev_row)
+            slow_pause()  # pausa tras guardar
 
+            # 2) PARTICIPANTES (si hay participants_list)
             if plist:
-                # participants_list
+                # Detecta lista y participantes
                 for attempt in range(1, 4):
                     driver.get(plist)
                     WebDriverWait(driver, 25).until(lambda d: d.find_element(By.TAG_NAME, "body"))
                     _accept_cookies(driver, By)
+                    slow_pause(1.0, 2.0)
 
-                    # Esperas
-                    # Después de cargar la página
-                    time.sleep(random.uniform(2, 3))  # espera entre 0.2 y 0.3 segundos
                     start = time.time()
-                    state = "timeout"
+                    state_page = "timeout"
                     while time.time() - start < 20:
                         if _is_login_page(driver):
-                            state = "login"; break
+                            state_page = "login"; break
                         toggles = driver.find_elements(By.CSS_SELECTOR, "[phx-click='booking_details_show']")
                         if toggles:
-                            state = "toggles"; break
+                            state_page = "toggles"; break
                         hints = (
                             "//p[contains(., 'No hay') or contains(., 'No results') or contains(., 'Sin participantes')]",
                             "//div[contains(., 'No hay') or contains(., 'No results') or contains(., 'Sin participantes')]",
                         )
                         if any(driver.find_elements(By.XPATH, xp) for xp in hints):
-                            state = "empty"; break
+                            state_page = "empty"; break
                         time.sleep(0.25)
 
-                    if state == "login":
+                    if state_page == "login":
                         if not _ensure_logged_in(driver, 2, By, WebDriverWait, EC):
                             log(f"No se pudo relogar para {plist}. Siguiente evento.")
                             break
                         else:
                             continue
-                    if state == "timeout":
+                    if state_page == "timeout":
                         log(f"participants_list tardó demasiado: {plist} (intento {attempt}/3)")
                         try: driver.refresh()
                         except Exception: pass
-                        time.sleep(random.uniform(1, 1.3))  # espera entre 0.2 y 0.3 segundos
+                        slow_pause(0.8, 1.3)
                         if attempt < 3:
                             continue
                         else:
                             break
-                    if state == "empty":
+                    if state_page == "empty":
                         log(f"participants_list sin participantes: {plist}")
                         break
 
@@ -765,10 +833,20 @@ def scrape_main():
                     total = len(booking_ids)
                     log(f"Toggles/participantes detectados: {total}")
 
+                    # Reanudar dentro del evento
+                    start_idx = _get_last_part_index(state, uuid) + 1  # 1-based
+                    if start_idx > total:
+                        start_idx = total + 1
+
                     for idx, pid in enumerate(booking_ids, start=1):
+                        if idx < start_idx:
+                            continue  # ya procesado
+
                         if idx % 25 == 0 or idx == total:
                             log(f"  - Progreso participantes: {idx}/{total}")
+
                         if not pid:
+                            _set_last_part_index(state, uuid, idx)
                             continue
 
                         block_el = _click_toggle_by_pid(
@@ -776,6 +854,8 @@ def scrape_main():
                             StaleElementReferenceException, NoSuchElementException, ElementClickInterceptedException
                         )
                         if not block_el:
+                            _set_last_part_index(state, uuid, idx)
+                            slow_pause(0.2, 0.5)
                             continue
 
                         painted = False
@@ -795,15 +875,17 @@ def scrape_main():
                                 )
                             time.sleep(RENDER_POLL_S)
                         if not painted:
+                            _set_last_part_index(state, uuid, idx)
+                            slow_pause(0.2, 0.5)
                             continue
 
                         try:
                             payload = driver.execute_script(JS_MAP_PARTICIPANT_RICH, pid)
-                        except JavascriptException:
-                            payload = _fallback_map_participant(driver, pid, By)
-
+                        except Exception:
+                            payload = None
                         if not payload or not isinstance(payload, dict):
-                            continue
+                            # Fallback
+                            payload = _fallback_map_participant(driver, pid, By)
 
                         fields = (payload.get("fields") or {})
                         schedule = (payload.get("schedule") or [])
@@ -833,55 +915,49 @@ def scrape_main():
                             "event_uuid": uuid,
                             "event_title": ev.get("title","N/D"),
                         }
+                        # Rellena slots fijos 1..6
+                        for i in range(1, 7):
+                            day = schedule[i-1]["day"] if i-1 < len(schedule) else ""
+                            fec = schedule[i-1]["fecha"] if i-1 < len(schedule) else ""
+                            man = schedule[i-1]["mangas"] if i-1 < len(schedule) else ""
+                            row[f"Día {i}"]    = _clean(day)
+                            row[f"Fecha {i}"]  = _clean(fec)
+                            row[f"Mangas {i}"] = _clean(man)
 
-                        for i, item in enumerate(schedule, start=1):
-                            row[f"Día {i}"]    = _clean(item.get("day")   or "")
-                            row[f"Fecha {i}"]  = _clean(item.get("fecha") or "")
-                            row[f"Mangas {i}"] = _clean(item.get("mangas")or "")
+                        # Escribe inmediatamente
+                        _append_csv_row(csv_part, PART_HEADER, row)
+                        # Guarda progreso por participante
+                        _set_last_part_index(state, uuid, idx)
+                        slow_pause()  # respiración entre participantes
 
-                        if any(v not in ("No disponible","") for k,v in row.items()
-                               if not (k.startswith("Día ") or k.startswith("Fecha ") or k.startswith("Mangas "))):
-                            all_part_rows.append(row)
+                    # terminado el bucle de participantes
+                    break  # evento con participants_list ya tratado
 
-                        if idx % 100 == 0 and idx < total:
-                            driver.execute_script("window.scrollBy(0, -200);")
-                            time.sleep(0.1)
-
-                    break  # fin participants para este evento
+            # Marcar evento finalizado (con o sin participantes)
+            _mark_event_done(state, uuid)
 
             if time.time() - start_event_ts > MAX_EVENT_SECONDS:
-                log(f"Evento {uuid} superó {MAX_EVENT_SECONDS}s. Continuo con el siguiente.")
+                log(f"Evento {uuid} superó {MAX_EVENT_SECONDS}s (continuo con el siguiente).")
                 continue
 
-        # Guardar CSVs
-        _write_csv(
-            csv_event,
-            all_event_rows,
-            header=[
-                "uuid","event_url","title","organizer","location","dates",
-                "header_1","header_2","header_3","header_4","header_5","header_6",
-                "judges"
-            ],
-        )
-        part_header = _build_participants_header(all_part_rows)
-        _write_csv(csv_part, all_part_rows, header=part_header)
-
-        # Resumen
+        # Resumen (lee tamaños de archivo como índice rápido)
+        ev_count = sum(1 for _ in open(csv_event, "r", encoding="utf-8-sig")) - 1 if os.path.exists(csv_event) else 0
+        pt_count = sum(1 for _ in open(csv_part,  "r", encoding="utf-8-sig")) - 1 if os.path.exists(csv_part)  else 0
         print("\n--- RESUMEN SCRAPE ---")
-        print(f"Eventos guardados:      {len(all_event_rows)} -> {csv_event}")
-        print(f"Participantes guardados:{len(all_part_rows)} -> {csv_part}")
-        if all_event_rows:
-            ej = all_event_rows[0]
-            print(f"Ejemplo evento: {ej.get('title','N/D')} | {ej.get('location','N/D')} | {ej.get('dates','N/D')}")
+        print(f"Eventos guardados (líneas):      {ev_count} -> {csv_event}")
+        print(f"Participantes guardados (líneas):{pt_count} -> {csv_part}")
+        print(f"Progreso en: {PROGRESS_PATH}")
         print("-----------------------\n")
 
     except Exception as e:
         log(f"ERROR: {e}")
         traceback.print_exc()
-        _save_screenshot(driver, f"error_{int(time.time())}.png")
+        try: _save_screenshot(driver, f"error_{int(time.time())}.png")
+        except Exception: pass
         sys.exit(1)
     finally:
-        driver.quit()
+        try: driver.quit()
+        except Exception: pass
 
 # ============================== PARTE 2: PROCESADO ==============================
 import pandas as pd
@@ -1192,24 +1268,16 @@ def process_main():
     print(f"OK -> {output_csv} | filas = {len(final)}")
 
     # ----------- BLOQUE EXTRA: “Pruebas próximas” por fecha -----------
-    # Nos basamos en el CSV de eventos (únicos) para no duplicar por participante.
     try:
         _print_upcoming_from_events(ev_sel)
     except Exception as e:
         print(f"(Aviso) No se pudieron listar 'pruebas próximas': {e}")
 
 def _parse_start_date_from_spanish_range(s: str):
-    """
-    Recibe 'Fechas' (p.ej. '31-07-2024 – 04-08-2024' o '31/07/2024-04/08/2024' o '31-07-2024')
-    y devuelve la fecha de INICIO como datetime.date. Si no puede, devuelve None.
-    """
     if not isinstance(s, str) or not s.strip():
         return None
     txt = s.replace("—", "-").replace("–", "-")
-    # Intenta coger el primer bloque que parezca fecha
-    # Separadores comunes
     parts = re.split(r"\s*[-–—aA]\s*|\s+al\s+|\s*hasta\s+", txt)
-    # parts ahora tiene candidatos; probamos el primero que parezca fecha
     for chunk in parts:
         chunk = chunk.strip()
         if not chunk:
@@ -1219,7 +1287,6 @@ def _parse_start_date_from_spanish_range(s: str):
             return dt.date()
         except Exception:
             continue
-    # Último intento: extraer dd-mm-yyyy explícito
     m = re.search(r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b", txt)
     if m:
         try:
@@ -1229,24 +1296,18 @@ def _parse_start_date_from_spanish_range(s: str):
     return None
 
 def _print_upcoming_from_events(ev_df: pd.DataFrame, horizon_days: int = 60):
-    """
-    Toma el DataFrame de eventos con columnas: uuid/event_url/title/organizer/location/dates
-    y muestra las pruebas cuyo inicio está en [hoy, hoy+horizon]
-    """
     print("\n===== PRUEBAS PRÓXIMAS =====")
     today = datetime.now().date()
     horizon = today + timedelta(days=horizon_days)
 
-    # Evitar duplicados por event_url/título
     df = ev_df.copy()
     if "event_url" in df.columns:
         df = df.drop_duplicates(subset=["event_url"])
     elif "title" in df.columns:
         df = df.drop_duplicates(subset=["title"])
 
-    # Parseo de inicio
     starts = []
-    for i, row in df.iterrows():
+    for _, row in df.iterrows():
         s = str(row.get("dates") or "")
         start_date = _parse_start_date_from_spanish_range(s)
         starts.append(start_date)
@@ -1260,8 +1321,6 @@ def _print_upcoming_from_events(ev_df: pd.DataFrame, horizon_days: int = 60):
         print("============================\n")
         return
 
-    # Agrupar por semana natural (Lunes-domingo) o por fecha exacta
-    # Aquí usamos fecha exacta.
     for d, grp in up.groupby("start_date", sort=True):
         print(f"\n>>> {d.strftime('%d-%m-%Y')}")
         for _, r in grp.iterrows():
@@ -1273,9 +1332,8 @@ def _print_upcoming_from_events(ev_df: pd.DataFrame, horizon_days: int = 60):
 
 # ============================== CLI / Entry point ==============================
 def main():
-    parser = argparse.ArgumentParser(description="FlowAgility scraper + procesado (+ próximas)")
+    parser = argparse.ArgumentParser(description="FlowAgility scraper + procesado (+ próximas) con pausas y reanudación")
     parser.add_argument("cmd", choices=["scrape","process","all"], nargs="?", default="all", help="Qué ejecutar")
-
     args = parser.parse_args()
 
     if args.cmd == "scrape":
