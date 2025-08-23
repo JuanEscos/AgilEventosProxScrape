@@ -1,0 +1,41 @@
+name: Calendario RSCE diario
+
+on:
+  schedule:
+    - cron: '5 2 * * *'   # 04:05 UTC
+  workflow_dispatch: {}    # para lanzarlo a mano
+
+jobs:
+  run_and_deploy:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Madrid
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Ejecutar script que genera el CSV
+        run: |
+          python "./EventosProx.py"
+          test -f "eventos_prox.csv"
+
+      - name: Copiar CSV al servidor (SSH key)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          # port: ${{ secrets.SSH_PORT }}     # quita esta línea si no lo defines
+          source: "eventos_agility_2025.csv"
+          target: "/home/agilitydivertidog/www/NewWeb/Privado/Competiciones/ListadoEventos/"
+          overwrite: true
