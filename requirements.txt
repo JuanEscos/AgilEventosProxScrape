@@ -1,0 +1,10 @@
+# Navegación y automatización del navegador
+selenium==4.21.0           # usa Selenium Manager (no necesitas webdriver-manager)
+
+# Carga de variables de entorno (.env)
+python-dotenv==1.0.1
+
+# Procesado de datos y fechas
+pandas==2.2.2
+numpy==1.26.4              # fija 1.26.* para evitar líos de ABI con algunas builds
+python-dateutil==2.9.0.post0
