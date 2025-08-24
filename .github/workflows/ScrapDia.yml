@@ -1,5 +1,4 @@
-name: Calendario RSCE diario
-
+name: Scrapy Eventos Prox diario
 on:
   schedule:
     - cron: '5 2 * * *'   # 04:05 UTC
