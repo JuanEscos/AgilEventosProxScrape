@@ -34,7 +34,7 @@ jobs:
       - name: Ejecutar script que genera el CSV
         run: |
           set -euo pipefail
-          python "./EventosProx.py"
+          python "./01_eventosprox.py"
 
       - name: Localizar CSV y calcular hash y tamaño
         id: csv
