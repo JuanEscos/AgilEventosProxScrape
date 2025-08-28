@@ -1,19 +1,22 @@
-name: Calendario RSCE diario
+name: Scrapy Eventos Prox diario
+
 on:
   schedule:
-    - cron: '5 4 * * *'   # 04:05 UTC
+    - cron: '5 2 * * *'    # 02:05 UTC (≈ 04:05 en Europa/Madrid en verano; 03:05 en invierno)
   workflow_dispatch: {}
 
 jobs:
-  run_and_upload:
+  run_and_deploy:
     runs-on: ubuntu-latest
     env:
       TZ: Europe/Madrid
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -26,50 +29,40 @@ jobs:
 
       - name: Ejecutar script que genera el CSV
         run: |
-          python "./01_eventosprox.py"
+          python "./EventosProx.py"
 
-      - name: Localizar CSV y calcular hash
+      - name: Localizar CSV y calcular hash/tamaño
         id: csv
         run: |
           set -euo pipefail
-          CSV_PATH="$(find . -type f -name 'competiciones_agility.json' -print -quit)"
+          CSV_PATH="$(find . -type f -name 'eventos_prox.csv' -print -quit)"
           if [ -z "$CSV_PATH" ]; then
-            echo 'No se encontró competiciones_agility.json'; exit 1
+            echo 'No se encontró eventos_prox.csv'; exit 1
           fi
           echo "csv_path=$CSV_PATH" >> "$GITHUB_OUTPUT"
           sha256sum "$CSV_PATH" | awk '{print $1}' > local.sha256
+          echo "local_hash=$(cut -d' ' -f1 local.sha256)" >> "$GITHUB_OUTPUT"
+          LOCAL_SIZE=$(stat -c%s "$CSV_PATH")
+          echo "local_size=$LOCAL_SIZE" >> "$GITHUB_OUTPUT"
 
       - name: Listar carpeta remota (antes de subir)
         env:
-          FTP_SERVER:     ${{ secrets.FTP_SERVER }}
-          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
+          FTP_SERVER:     ${{ secrets.FTP_SERVER }}      # p.ej. agilitydivertidog-com.espacioseguro.com
+          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}    # p.ej. agilitydivertidog
           FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}   # /www/NewWeb/Privado
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}  # /www/NewWeb/Privado
         run: |
           set -euo pipefail
           BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ListadoEventos"
+          echo "Listando: ${BASE}/"
           curl --fail --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l || true
 
-      - name: Subir CSV por FTPS (TLS explícito en 21)
+      - name: "Subir CSV por FTPS (robusto: binario, no EPSV, temp+rename)"
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
           FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
-        run: |
-          set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ListadoEventos"
-          curl --fail --ssl-reqd --ftp-create-dirs --disable-epsv --ftp-skip-pasv-ip \
-               --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
-               --upload-file "${{ steps.csv.outputs.csv_path }}" \
-               "${BASE}/competiciones_agility.json"
-
-      - name: Subir CSV por FTPS (robusto: binario, no EPSV, temp+rename)
-        env:
-          FTP_SERVER:      ${{ secrets.FTP_SERVER }}
-          FTP_USERNAME:    ${{ secrets.FTP_USERNAME }}
-          FTP_PASSWORD:    ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR:  ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
           FULL_DIR="${FTP_REMOTE_DIR}/Competiciones/ListadoEventos"
@@ -80,17 +73,18 @@ jobs:
 
           echo "Subiendo temporal: $TMP"
           curl --fail --ssl-reqd --ftp-create-dirs --disable-epsv --ftp-skip-pasv-ip \
-                 --quote "TYPE I" --quote "PBSZ 0" --quote "PROT P" \
-                 --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
-                 --upload-file "${{ steps.csv.outputs.csv_path }}" "$TMP"
+               --quote "TYPE I" --quote "PBSZ 0" --quote "PROT P" \
+               --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
+               --upload-file "${{ steps.csv.outputs.csv_path }}" "$TMP"
+
           echo "Renombrando a definitivo…"
           curl --fail --ssl-reqd \
-                 --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
-                 --quote "RNFR ${FULL_DIR}/${FILE}.part" \
-                 --quote "RNTO ${FULL_DIR}/${FILE}" \
-                 "ftp://${FTP_SERVER}/"
+               --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
+               --quote "RNFR ${FULL_DIR}/${FILE}.part" \
+               --quote "RNTO ${FULL_DIR}/${FILE}" \
+               "ftp://${FTP_SERVER}/"
 
-      - name: Verificar remoto (descargar y comparar hash)
+      - name: Verificar remoto (descargar y comparar hash/tamaño)
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
@@ -98,10 +92,23 @@ jobs:
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Calendar"
+          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ListadoEventos"
+          FILE="eventos_prox.csv"
+
+          echo "Listando tras subir: ${BASE}/"
+          curl --fail --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l
+
+          echo "Descargando para verificación…"
           curl --fail --ssl-reqd --disable-epsv --ftp-skip-pasv-ip \
                --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
-               --output remote.csv "${BASE}/competiciones_agility.json"
+               --output remote.csv "${BASE}/${FILE}"
+
           sha256sum remote.csv | awk '{print $1}' > remote.sha256
+          echo "Hash local : ${{ steps.csv.outputs.local_hash }}"
+          echo "Hash remoto: $(cut -d' ' -f1 remote.sha256)"
           diff -q local.sha256 remote.sha256
-          echo "Hash OK"
+
+          REMOTE_SIZE=$(stat -c%s remote.csv)
+          echo "Tamaño remoto: $REMOTE_SIZE bytes"
+          test "$REMOTE_SIZE" -eq "${{ steps.csv.outputs.local_size }}"
+          echo "OK: hash y tamaño coinciden"
