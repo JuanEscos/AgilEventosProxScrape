@@ -1,5 +1,6 @@
 name: Scrapy Eventos Prox diario
 
+
 on:
   schedule:
     - cron: '5 2 * * *'    # 02:05 UTC (≈ 04:05 en Europa/Madrid en verano; 03:05 en invierno)
