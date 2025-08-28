@@ -2,7 +2,7 @@ name: Scrapy Eventos Prox diario
 
 on:
   schedule:
-    - cron: '5 2 * * *'    # 02:05 UTC (≈ 04:05 en Europa/Madrid en verano; 03:05 en invierno)
+    - cron: '5 2 * * *'    # 02:05 UTC (≈ 04:05 Madrid en verano; 03:05 en invierno)
   workflow_dispatch: {}
 
 jobs:
@@ -10,6 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Europe/Madrid
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -24,14 +27,16 @@ jobs:
 
       - name: Instalar dependencias (si existe requirements.txt)
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Ejecutar script que genera el CSV
         run: |
+          set -euo pipefail
           python "./EventosProx.py"
 
-      - name: Localizar CSV y calcular hash/tamaño
+      - name: Localizar CSV y calcular hash y tamaño
         id: csv
         run: |
           set -euo pipefail
@@ -45,19 +50,19 @@ jobs:
           LOCAL_SIZE=$(stat -c%s "$CSV_PATH")
           echo "local_size=$LOCAL_SIZE" >> "$GITHUB_OUTPUT"
 
-      - name: Listar carpeta remota (antes de subir)
+      - name: Listar carpeta remota antes de subir
         env:
-          FTP_SERVER:     ${{ secrets.FTP_SERVER }}      # p.ej. agilitydivertidog-com.espacioseguro.com
-          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}    # p.ej. agilitydivertidog
+          FTP_SERVER:     ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
           FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}  # /www/NewWeb/Privado
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
           BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ListadoEventos"
           echo "Listando: ${BASE}/"
           curl --fail --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l || true
 
-      - name: "Subir CSV por FTPS (robusto: binario, no EPSV, temp+rename)"
+      - name: Subir CSV por FTPS - robusto (binario, no EPSV, temp+rename)
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
@@ -77,14 +82,14 @@ jobs:
                --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
                --upload-file "${{ steps.csv.outputs.csv_path }}" "$TMP"
 
-          echo "Renombrando a definitivo…"
+          echo "Renombrando a definitivo"
           curl --fail --ssl-reqd \
                --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
                --quote "RNFR ${FULL_DIR}/${FILE}.part" \
                --quote "RNTO ${FULL_DIR}/${FILE}" \
                "ftp://${FTP_SERVER}/"
 
-      - name: Verificar remoto (descargar y comparar hash/tamaño)
+      - name: Verificar remoto descargando y comparando hash y tamaño
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
@@ -98,7 +103,7 @@ jobs:
           echo "Listando tras subir: ${BASE}/"
           curl --fail --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l
 
-          echo "Descargando para verificación…"
+          echo "Descargando para verificación"
           curl --fail --ssl-reqd --disable-epsv --ftp-skip-pasv-ip \
                --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
                --output remote.csv "${BASE}/${FILE}"
