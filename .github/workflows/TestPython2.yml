@@ -1,57 +1,117 @@
-name: Eventos diario
+name: Scrape FlowAgility diario
 
 on:
   schedule:
-    - cron: '5 4 * * *'   # 04:05 UTC
-  workflow_dispatch: {}
+    - cron: '5 2 * * *'   # 02:05 UTC ≈ 04:05 Madrid (verano) / 03:05 (invierno)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scrape-flowagility
+  cancel-in-progress: true
 
 jobs:
-  run_and_upload:
+  run-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       TZ: Europe/Madrid
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      # Chrome + ChromeDriver (con outputs para ruta del binario)
+      - name: Setup Chrome (browser + chromedriver)
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+          install-dependencies: true
+          install-chromedriver: true
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
           cache-dependency-path: requirements.txt
 
-      - name: Instalar dependencias (si existe requirements.txt)
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Ejecutar script que genera el CSV
-        run: |
-          python "./Calendario.py"
-
-      - name: Localizar CSV y calcular hash
-        id: csv
+      - name: Instalar dependencias
         run: |
           set -euo pipefail
-          CSV_PATH="$(find . -type f -name 'eventos_agility_2025.csv' -print -quit)"
-          if [ -z "$CSV_PATH" ]; then
-            echo 'No se encontró eventos_agility_2025.csv'; exit 1
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install selenium webdriver-manager beautifulsoup4 python-dotenv
           fi
-          echo "csv_path=$CSV_PATH" >> "$GITHUB_OUTPUT"
-          sha256sum "$CSV_PATH" | awk '{print $1}' > local.sha256
 
+      - name: Ejecutar scraper
+        env:
+          # Secrets de login (crearlos en Settings > Secrets and variables > Actions)
+          FLOW_USER_EMAIL: ${{ secrets.FLOW_USER_EMAIL }}
+          FLOW_USER_PASSWORD: ${{ secrets.FLOW_USER_PASSWORD }}
+          # Forzar modo headless en CI
+          HEADLESS: "true"
+          INCOGNITO: "true"
+          OUT_DIR: "./output"
+          # Pasamos rutas de Chrome/Driver al script (lo usará si las detecta)
+          CHROME_BINARY: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
+        run: |
+          set -euo pipefail
+          python ./Calendario.py   # <-- o ./EventosProx.py si ese es el que usas
+
+      - name: Localizar salida (CSV o JSON) y calcular hash/tamaño
+        id: find
+        run: |
+          set -euo pipefail
+          CSV_PATH="$(find . -type f -name 'eventos_prox.csv' -print -quit || true)"
+          JSON_PATH="$(find . -type f -name 'events.json' -print -quit || true)"
+          if [ -n "$CSV_PATH" ]; then
+            ART="$CSV_PATH"; NAME="eventos_prox.csv"
+          elif [ -n "$JSON_PATH" ]; then
+            ART="$JSON_PATH"; NAME="events.json"
+          else
+            echo "::error::No se encontró ni eventos_prox.csv ni events.json"
+            exit 1
+          fi
+          echo "artifact_path=$ART"  >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$NAME" >> "$GITHUB_OUTPUT"
+          sha256sum "$ART" | awk '{print $1}' > local.sha256
+          echo "local_hash=$(cut -d' ' -f1 local.sha256)" >> "$GITHUB_OUTPUT"
+          echo "local_size=$(stat -c%s "$ART")" >> "$GITHUB_OUTPUT"
+
+      - name: Subir artefacto (CSV o JSON)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.find.outputs.artifact_name }}
+          path: ${{ steps.find.outputs.artifact_path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      # ---- BLOQUE FTPS (solo si hay CSV y hay secrets de FTP) ----
       - name: Listar carpeta remota (antes de subir)
+        if: ${{ steps.find.outputs.artifact_name == 'eventos_prox.csv' && secrets.FTP_SERVER && secrets.FTP_USERNAME && secrets.FTP_PASSWORD && secrets.FTP_REMOTE_DIR }}
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
           FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}   # /www/NewWeb/Privado
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones"
+          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ListadoEventos"
+          echo 'Listando: '"${BASE}/"
           curl --fail --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l || true
 
-      - name: Subir CSV por FTPS (TLS explícito en 21)
+      - name: Subir CSV por FTPS (temp + rename, binario)
+        if: ${{ steps.find.outputs.artifact_name == 'eventos_prox.csv' && secrets.FTP_SERVER && secrets.FTP_USERNAME && secrets.FTP_PASSWORD && secrets.FTP_REMOTE_DIR }}
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
@@ -59,13 +119,27 @@ jobs:
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones"
-          curl --fail --ssl-reqd --ftp-create-dirs --disable-epsv --ftp-skip-pasv-ip \
-               --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
-               --upload-file "${{ steps.csv.outputs.csv_path }}" \
-               "${BASE}/eventos_agility_2025.csv"
+          FULL_DIR="${FTP_REMOTE_DIR}/Competiciones/ListadoEventos"
+          BASE="ftp://${FTP_SERVER}${FULL_DIR}"
+          FILE="eventos_prox.csv"
+          TMP="${BASE}/${FILE}.part"
+          SRC="${{ steps.find.outputs.artifact_path }}"
 
-      - name: Verificar remoto (descargar y comparar hash)
+          echo 'Subiendo temporal: '"$TMP"
+          curl --fail --ssl-reqd --ftp-create-dirs --disable-epsv --ftp-skip-pasv-ip \
+               --quote "TYPE I" --quote "PBSZ 0" --quote "PROT P" \
+               --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
+               --upload-file "$SRC" "$TMP"
+
+          echo 'Renombrando a definitivo'
+          curl --fail --ssl-reqd \
+               --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
+               --quote "RNFR ${FULL_DIR}/${FILE}.part" \
+               --quote "RNTO ${FULL_DIR}/${FILE}" \
+               "ftp://${FTP_SERVER}/"
+
+      - name: Verificar remoto (hash y tamaño)
+        if: ${{ steps.find.outputs.artifact_name == 'eventos_prox.csv' && secrets.FTP_SERVER && secrets.FTP_USERNAME && secrets.FTP_PASSWORD && secrets.FTP_REMOTE_DIR }}
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
@@ -73,10 +147,23 @@ jobs:
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
-          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones"
+          BASE="ftp://${FTP_SERVER}${FTP_REMOTE_DIR}/Competiciones/ListadoEventos"
+          FILE="eventos_prox.csv"
+
+          echo 'Listando tras subir: '"${BASE}/"
+          curl --fail --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l
+
+          echo 'Descargando para verificación'
           curl --fail --ssl-reqd --disable-epsv --ftp-skip-pasv-ip \
                --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
-               --output remote.csv "${BASE}/eventos_agility_2025.csv"
+               --output remote.csv "${BASE}/${FILE}"
+
           sha256sum remote.csv | awk '{print $1}' > remote.sha256
+          echo "Hash local : ${{ steps.find.outputs.local_hash }}"
+          echo "Hash remoto: $(cut -d' ' -f1 remote.sha256)"
           diff -q local.sha256 remote.sha256
-          echo "Hash OK"
+
+          REMOTE_SIZE=$(stat -c%s remote.csv)
+          echo "Tamaño remoto: $REMOTE_SIZE bytes"
+          test "$REMOTE_SIZE" -eq "${{ steps.find.outputs.local_size }}"
+          echo "OK: hash y tamaño coinciden"
