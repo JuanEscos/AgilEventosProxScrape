@@ -26,7 +26,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Chrome + ChromeDriver (con outputs para ruta del binario)
       - name: Setup Chrome (browser + chromedriver)
         id: setup-chrome
         uses: browser-actions/setup-chrome@v2
@@ -54,21 +53,18 @@ jobs:
 
       - name: Ejecutar scraper
         env:
-          # Secrets de login (crearlos en Settings > Secrets and variables > Actions)
           FLOW_USER_EMAIL: ${{ secrets.FLOW_USER_EMAIL }}
           FLOW_USER_PASSWORD: ${{ secrets.FLOW_USER_PASSWORD }}
-          # Forzar modo headless en CI
           HEADLESS: "true"
           INCOGNITO: "true"
           OUT_DIR: "./output"
-          # Pasamos rutas de Chrome/Driver al script (lo usará si las detecta)
           CHROME_BINARY: ${{ steps.setup-chrome.outputs.chrome-path }}
           CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
         run: |
           set -euo pipefail
-          python ./Calendario.py   # <-- o ./EventosProx.py si ese es el que usas
+          python ./Calendario.py
 
-      - name: Localizar salida (CSV o JSON) y calcular hash/tamaño
+      - name: Localizar salida y calcular hash/tamaño
         id: find
         run: |
           set -euo pipefail
@@ -96,9 +92,29 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # ---- BLOQUE FTPS (solo si hay CSV y hay secrets de FTP) ----
+      # ---- Comprobar si existen secretos de FTP (sin usarlos en if:) ----
+      - name: Determinar si hay secretos FTP
+        id: hasftp
+        env:
+          FTP_SERVER:     ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD:   ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -n "${FTP_SERVER:-}" ] && [ -n "${FTP_USERNAME:-}" ] && [ -n "${FTP_PASSWORD:-}" ] && [ -n "${FTP_REMOTE_DIR:-}" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Aviso si faltan secretos FTP
+        if: ${{ steps.hasftp.outputs.ok != 'true' }}
+        run: echo "::notice::Saltando FTPS: faltan uno o más secretos (FTP_SERVER/FTP_USERNAME/FTP_PASSWORD/FTP_REMOTE_DIR)"
+
+      # ---- FTPS: solo si hay CSV + secretos presentes ----
       - name: Listar carpeta remota (antes de subir)
-        if: ${{ steps.find.outputs.artifact_name == 'eventos_prox.csv' && secrets.FTP_SERVER && secrets.FTP_USERNAME && secrets.FTP_PASSWORD && secrets.FTP_REMOTE_DIR }}
+        if: ${{ steps.find.outputs.artifact_name == 'eventos_prox.csv' && steps.hasftp.outputs.ok == 'true' }}
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
@@ -111,7 +127,7 @@ jobs:
           curl --fail --ssl-reqd --user "${FTP_USERNAME}:${FTP_PASSWORD}" "${BASE}/" -l || true
 
       - name: Subir CSV por FTPS (temp + rename, binario)
-        if: ${{ steps.find.outputs.artifact_name == 'eventos_prox.csv' && secrets.FTP_SERVER && secrets.FTP_USERNAME && secrets.FTP_PASSWORD && secrets.FTP_REMOTE_DIR }}
+        if: ${{ steps.find.outputs.artifact_name == 'eventos_prox.csv' && steps.hasftp.outputs.ok == 'true' }}
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
@@ -139,7 +155,7 @@ jobs:
                "ftp://${FTP_SERVER}/"
 
       - name: Verificar remoto (hash y tamaño)
-        if: ${{ steps.find.outputs.artifact_name == 'eventos_prox.csv' && secrets.FTP_SERVER && secrets.FTP_USERNAME && secrets.FTP_PASSWORD && secrets.FTP_REMOTE_DIR }}
+        if: ${{ steps.find.outputs.artifact_name == 'eventos_prox.csv' && steps.hasftp.outputs.ok == 'true' }}
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
           FTP_USERNAME:   ${{ secrets.FTP_USERNAME }}
