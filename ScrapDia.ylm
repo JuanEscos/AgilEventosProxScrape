@@ -64,6 +64,32 @@ jobs:
                --upload-file "${{ steps.csv.outputs.csv_path }}" \
                "${BASE}/competiciones_agility.json"
 
+      - name: Subir CSV por FTPS (robusto: binario, no EPSV, temp+rename)
+        env:
+          FTP_SERVER:      ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME:    ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD:    ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR:  ${{ secrets.FTP_REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          FULL_DIR="${FTP_REMOTE_DIR}/Competiciones/ListadoEventos"
+          BASE="ftp://${FTP_SERVER}${FULL_DIR}"
+          FILE="eventos_prox.csv"
+          TMP="${BASE}/${FILE}.part"
+          FINAL="${BASE}/${FILE}"
+
+          echo "Subiendo temporal: $TMP"
+          curl --fail --ssl-reqd --ftp-create-dirs --disable-epsv --ftp-skip-pasv-ip \
+                 --quote "TYPE I" --quote "PBSZ 0" --quote "PROT P" \
+                 --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
+                 --upload-file "${{ steps.csv.outputs.csv_path }}" "$TMP"
+          echo "Renombrando a definitivo…"
+          curl --fail --ssl-reqd \
+                 --user "${FTP_USERNAME}:${FTP_PASSWORD}" \
+                 --quote "RNFR ${FULL_DIR}/${FILE}.part" \
+                 --quote "RNTO ${FULL_DIR}/${FILE}" \
+                 "ftp://${FTP_SERVER}/"
+
       - name: Verificar remoto (descargar y comparar hash)
         env:
           FTP_SERVER:     ${{ secrets.FTP_SERVER }}
